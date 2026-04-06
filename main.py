@@ -826,6 +826,11 @@ async def detect_supply_demand(req: SupplyDemandRequest):
         raise HTTPException(status_code=500, detail=f"{str(e)}\n{traceback.format_exc()}")
 
 
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "finance-talib-service"}
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "talib_version": talib.__ta_version__.decode() if hasattr(talib, '__ta_version__') else "unknown"}
