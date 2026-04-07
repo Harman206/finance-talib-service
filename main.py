@@ -591,21 +591,33 @@ async def detect_trendlines(req: TrendlineRequest):
     try:
         import pytrendline as ptl
 
-        # Build DataFrame for pytrendline
+        # Build DataFrame for pytrendline — OHLC must be float dtype
         df = pd.DataFrame({
             "Date": pd.to_datetime(req.dates),
-            "Open": req.ohlcv.open,
-            "High": req.ohlcv.high,
-            "Low": req.ohlcv.low,
-            "Close": req.ohlcv.close,
-            "Volume": req.ohlcv.volume,
+            "Open": pd.array(req.ohlcv.open, dtype="float64"),
+            "High": pd.array(req.ohlcv.high, dtype="float64"),
+            "Low": pd.array(req.ohlcv.low, dtype="float64"),
+            "Close": pd.array(req.ohlcv.close, dtype="float64"),
+            "Volume": pd.array(req.ohlcv.volume, dtype="float64"),
         })
 
-        candle_data = ptl.CandlestickData(df=df, datetime_col="Date")
+        candle_data = ptl.CandlestickData(
+            df=df,
+            datetime_col="Date",
+            time_interval="1d",  # daily candles — critical for slope calculation
+        )
+
+        # trend_type must be uppercase to match pytrendline.TrendlineTypes
+        trend_type_map = {
+            "both": ptl.TrendlineTypes.BOTH,
+            "support": ptl.TrendlineTypes.SUPPORT,
+            "resistance": ptl.TrendlineTypes.RESISTANCE,
+        }
+        ptl_trend_type = trend_type_map.get(req.trend_type.lower(), ptl.TrendlineTypes.BOTH)
 
         result = ptl.detect(
             candlestick_data=candle_data,
-            trend_type=req.trend_type,
+            trend_type=ptl_trend_type,
             ignore_breakouts=req.ignore_breakouts,
             min_points_required=req.min_points,
             first_pt_must_be_pivot=True,
