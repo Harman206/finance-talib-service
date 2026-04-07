@@ -60,10 +60,8 @@ class TrendlineRequest(BaseModel):
     ohlcv: OHLCVData
     dates: list[str]  # YYYY-MM-DD for each candle
     trend_type: str = "both"  # "support", "resistance", or "both"
-    ignore_breakouts: bool = False  # False to keep major trendlines even if broken
-    min_points: int = 3
-    max_results_per_type: int = 3  # max trendlines per type (support/resistance)
-    min_span_pct: float = 0.15  # trendline must span at least 15% of the data range
+    max_results_per_type: int = 2  # max trendlines per type (1 primary + 1 secondary)
+    min_span_pct: float = 0.20  # trendline must span at least 20% of the data range
 
 
 class SupplyDemandRequest(BaseModel):
@@ -585,94 +583,199 @@ async def list_available():
     }
 
 
+def _find_pivots(prices: np.ndarray, order: int = 5):
+    """
+    Find pivot highs and pivot lows.
+    A pivot high at index i means prices[i] is the max in [i-order, i+order].
+    A pivot low at index i means prices[i] is the min in [i-order, i+order].
+    """
+    n = len(prices)
+    pivot_highs = []
+    pivot_lows = []
+    for i in range(order, n - order):
+        window = prices[i - order: i + order + 1]
+        if prices[i] == np.max(window):
+            pivot_highs.append(i)
+        if prices[i] == np.min(window):
+            pivot_lows.append(i)
+    return pivot_lows, pivot_highs
+
+
+def _fit_lines_through_pivots(
+    prices: np.ndarray,
+    highs: np.ndarray,
+    lows: np.ndarray,
+    pivot_indices: list[int],
+    n: int,
+    line_type: str,  # 'support' or 'resistance'
+    max_lines: int = 2,
+    min_span_pct: float = 0.20,
+):
+    """
+    For each pair of pivots, fit a line and validate:
+    - Support: line must stay at or below the lows (no candle low pierces below)
+    - Resistance: line must stay at or above the highs (no candle high pierces above)
+    - Count how many pivots the line touches (within ATR tolerance)
+    - Line must span at least min_span_pct of total data
+    """
+    min_span = int(n * min_span_pct)
+    atr_arr = talib.ATR(highs, lows, prices, timeperiod=14)
+    avg_atr = float(np.nanmean(atr_arr[~np.isnan(atr_arr)])) if np.any(~np.isnan(atr_arr)) else 1.0
+    tolerance = avg_atr * 0.15  # how close a pivot must be to "touch" the line
+    violation_tolerance = avg_atr * 0.05  # small allowance for minor wicks
+
+    candidates = []
+
+    for i in range(len(pivot_indices)):
+        for j in range(i + 1, len(pivot_indices)):
+            idx_a = pivot_indices[i]
+            idx_b = pivot_indices[j]
+
+            if idx_b - idx_a < min_span:
+                continue
+
+            # Use actual prices at pivots (lows for support, highs for resistance)
+            if line_type == 'support':
+                price_a = float(lows[idx_a])
+                price_b = float(lows[idx_b])
+            else:
+                price_a = float(highs[idx_a])
+                price_b = float(highs[idx_b])
+
+            slope = (price_b - price_a) / (idx_b - idx_a)
+            intercept = price_a - slope * idx_a
+
+            # Validate: check that the line doesn't cut through candles
+            violations = 0
+            touches = 0
+            for k in range(idx_a, min(idx_b + 1, n)):
+                line_price = slope * k + intercept
+                if line_type == 'support':
+                    # Support line should be at or below the lows
+                    if lows[k] < line_price - violation_tolerance:
+                        violations += 1
+                    if abs(lows[k] - line_price) < tolerance:
+                        touches += 1
+                else:
+                    # Resistance line should be at or above the highs
+                    if highs[k] > line_price + violation_tolerance:
+                        violations += 1
+                    if abs(highs[k] - line_price) < tolerance:
+                        touches += 1
+
+            span = idx_b - idx_a
+            max_violations = max(2, int(span * 0.08))  # allow up to 8% violations
+
+            if violations > max_violations:
+                continue
+            if touches < 2:
+                continue
+
+            # Score: more touches + longer span + fewer violations = better
+            score = (touches ** 2) * (span / n) * (1.0 / (1 + violations))
+
+            candidates.append({
+                'idx_a': idx_a,
+                'idx_b': idx_b,
+                'price_a': price_a,
+                'price_b': price_b,
+                'slope': slope,
+                'intercept': intercept,
+                'touches': touches,
+                'violations': violations,
+                'span': span,
+                'score': score,
+            })
+
+    # Sort by score descending
+    candidates.sort(key=lambda c: c['score'], reverse=True)
+
+    # Deduplicate: skip lines too similar to already-selected ones
+    selected = []
+    for c in candidates:
+        if len(selected) >= max_lines:
+            break
+        is_dup = False
+        for s in selected:
+            # Similar if slope is close AND they overlap significantly
+            slope_diff = abs(c['slope'] - s['slope'])
+            price_diff = abs(c['price_a'] - s['price_a'])
+            if slope_diff < avg_atr * 0.001 and price_diff < avg_atr * 0.5:
+                is_dup = True
+                break
+        if not is_dup:
+            selected.append(c)
+
+    return selected
+
+
 @app.post("/api/trendlines")
-async def detect_trendlines(req: TrendlineRequest):
-    """Detect support/resistance trendlines using pytrendline library."""
+async def detect_trendlines_endpoint(req: TrendlineRequest):
+    """
+    Detect support/resistance trendlines using pivot detection + linear regression.
+    Draws lines through actual swing highs/lows, validated to not cut through candles.
+    """
     try:
-        import pytrendline as ptl
+        h = to_np(req.ohlcv.high)
+        l = to_np(req.ohlcv.low)
+        c = to_np(req.ohlcv.close)
+        n = len(c)
 
-        # Build DataFrame for pytrendline — OHLC must be float dtype
-        df = pd.DataFrame({
-            "Date": pd.to_datetime(req.dates),
-            "Open": pd.array(req.ohlcv.open, dtype="float64"),
-            "High": pd.array(req.ohlcv.high, dtype="float64"),
-            "Low": pd.array(req.ohlcv.low, dtype="float64"),
-            "Close": pd.array(req.ohlcv.close, dtype="float64"),
-            "Volume": pd.array(req.ohlcv.volume, dtype="float64"),
-        })
+        if n < 20:
+            return {"trendlines": [], "total": 0}
 
-        candle_data = ptl.CandlestickData(
-            df=df,
-            datetime_col="Date",
-            time_interval="1d",  # daily candles — critical for slope calculation
-        )
-
-        # trend_type must be uppercase to match pytrendline.TrendlineTypes
-        trend_type_map = {
-            "both": ptl.TrendlineTypes.BOTH,
-            "support": ptl.TrendlineTypes.SUPPORT,
-            "resistance": ptl.TrendlineTypes.RESISTANCE,
-        }
-        ptl_trend_type = trend_type_map.get(req.trend_type.lower(), ptl.TrendlineTypes.BOTH)
-
-        result = ptl.detect(
-            candlestick_data=candle_data,
-            trend_type=ptl_trend_type,
-            ignore_breakouts=req.ignore_breakouts,
-            min_points_required=req.min_points,
-            first_pt_must_be_pivot=True,
-            last_pt_must_be_pivot=True,
-        )
+        # Adaptive pivot order: larger window for more data
+        order = max(3, n // 25)
+        pivot_lows, pivot_highs = _find_pivots(c, order=order)
 
         trendlines = []
-        total_candles = len(req.dates)
-        min_span = int(total_candles * req.min_span_pct)  # minimum index span for a trendline
+        trend_type = req.trend_type.lower()
 
-        def extract_trendlines(trends_df, ttype):
-            if trends_df is None or len(trends_df) == 0:
-                return
-            # Get best from each duplicate group, sorted by score
-            best = trends_df[trends_df["is_best_from_duplicate_group"] == True].sort_values("score", ascending=False)
-            count = 0
-            for _, row in best.iterrows():
-                if count >= req.max_results_per_type:
-                    break
-                indices = row["pointset_indeces"]
-                first_idx = int(indices[0])
-                last_idx = int(indices[-1])
-                span = last_idx - first_idx
-
-                # Skip trendlines that are too short — they're noise
-                if span < min_span:
-                    continue
-
+        if trend_type in ('both', 'support') and len(pivot_lows) >= 2:
+            support_lines = _fit_lines_through_pivots(
+                c, h, l, pivot_lows, n,
+                line_type='support',
+                max_lines=req.max_results_per_type,
+                min_span_pct=req.min_span_pct,
+            )
+            for line in support_lines:
                 trendlines.append({
-                    "type": ttype,
-                    "startIndex": first_idx,
-                    "startDate": req.dates[first_idx] if first_idx < len(req.dates) else None,
-                    "startPrice": round(float(row["m"] * first_idx + row["b"]), 2),
-                    "endIndex": last_idx,
-                    "endDate": req.dates[last_idx] if last_idx < len(req.dates) else None,
-                    "endPrice": round(float(row["m"] * last_idx + row["b"]), 2),
-                    "numPoints": int(row["num_points"]),
-                    "slope": round(float(row["slope"]), 6),
-                    "score": round(float(row["score"]), 2),
-                    "isBreakout": bool(row["is_breakout"]),
-                    "priceAtLastCandle": round(float(row["price_at_last_date"]), 2),
-                    "pointIndices": [int(x) for x in indices],
-                    "pointDates": [req.dates[int(x)] for x in indices if int(x) < len(req.dates)],
+                    "type": "support",
+                    "startIndex": line['idx_a'],
+                    "startDate": req.dates[line['idx_a']],
+                    "startPrice": round(line['price_a'], 2),
+                    "endIndex": line['idx_b'],
+                    "endDate": req.dates[line['idx_b']],
+                    "endPrice": round(line['price_b'], 2),
+                    "numPoints": line['touches'],
+                    "slope": round(line['slope'], 6),
+                    "score": round(line['score'], 4),
+                    "violations": line['violations'],
                 })
-                count += 1
 
-        if req.trend_type == "both":
-            extract_trendlines(result.get("support_trendlines"), "support")
-            extract_trendlines(result.get("resistance_trendlines"), "resistance")
-        elif req.trend_type == "support":
-            extract_trendlines(result.get("support_trendlines"), "support")
-        else:
-            extract_trendlines(result.get("resistance_trendlines"), "resistance")
+        if trend_type in ('both', 'resistance') and len(pivot_highs) >= 2:
+            resistance_lines = _fit_lines_through_pivots(
+                c, h, l, pivot_highs, n,
+                line_type='resistance',
+                max_lines=req.max_results_per_type,
+                min_span_pct=req.min_span_pct,
+            )
+            for line in resistance_lines:
+                trendlines.append({
+                    "type": "resistance",
+                    "startIndex": line['idx_a'],
+                    "startDate": req.dates[line['idx_a']],
+                    "startPrice": round(line['price_a'], 2),
+                    "endIndex": line['idx_b'],
+                    "endDate": req.dates[line['idx_b']],
+                    "endPrice": round(line['price_b'], 2),
+                    "numPoints": line['touches'],
+                    "slope": round(line['slope'], 6),
+                    "score": round(line['score'], 4),
+                    "violations": line['violations'],
+                })
 
-        # Sort by score descending
+        # Sort by score
         trendlines.sort(key=lambda t: t["score"], reverse=True)
 
         return {"trendlines": trendlines, "total": len(trendlines)}
