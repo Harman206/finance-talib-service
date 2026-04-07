@@ -4,4 +4,7 @@ numpy>=1.26.4
 pandas>=2.2.2
 ta-lib>=0.6.8
 pydantic==2.9.2
-pytrendline
+trendln>=0.1.10
+findiff>=0.10.0
+scipy>=1.10.0
+scikit-image>=0.20.0

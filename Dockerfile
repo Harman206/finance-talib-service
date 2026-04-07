@@ -13,10 +13,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Patch pytrendline for pandas 2.x compatibility (df.append was removed)
-COPY patch_pytrendline.py .
-RUN python patch_pytrendline.py
-
 COPY main.py .
 
 EXPOSE 8000
